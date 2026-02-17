@@ -81,11 +81,14 @@ class PRReviewer:
             "language": self.main_language,
             "diff": "",  # empty diff for initial calculation
             "num_pr_files": self.git_provider.get_num_of_files(),
+            "num_max_findings": get_settings().pr_reviewer.num_max_findings,
             "require_score": get_settings().pr_reviewer.require_score_review,
             "require_tests": get_settings().pr_reviewer.require_tests_review,
             "require_estimate_effort_to_review": get_settings().pr_reviewer.require_estimate_effort_to_review,
+            "require_estimate_contribution_time_cost": get_settings().pr_reviewer.require_estimate_contribution_time_cost,
             'require_can_be_split_review': get_settings().pr_reviewer.require_can_be_split_review,
             'require_security_review': get_settings().pr_reviewer.require_security_review,
+            'require_todo_scan': get_settings().pr_reviewer.get("require_todo_scan", False),
             'question_str': question_str,
             'answer_str': answer_str,
             "extra_instructions": get_settings().pr_reviewer.extra_instructions,
@@ -157,24 +160,31 @@ class PRReviewer:
             pr_review = self._prepare_pr_review()
             get_logger().debug(f"PR output", artifact=pr_review)
 
-            if get_settings().config.publish_output:
-                # publish the review
-                if get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
-                    final_update_message = get_settings().pr_reviewer.final_update_message
-                    self.git_provider.publish_persistent_comment(pr_review,
-                                                                 initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
-                                                                 update_header=True,
-                                                                 final_update_message=final_update_message, )
-                else:
-                    self.git_provider.publish_comment(pr_review)
-
-                self.git_provider.remove_initial_comment()
-            else:
-                get_logger().info("Review output is not published")
+            should_publish = get_settings().config.publish_output and self._should_publish_review_no_suggestions(pr_review)
+            if not should_publish:
+                reason = "Review output is not published"
+                if get_settings().config.publish_output:
+                    reason += ": no major issues detected."
+                get_logger().info(reason)
                 get_settings().data = {"artifact": pr_review}
                 return
+
+            # publish the review
+            if get_settings().pr_reviewer.persistent_comment and not self.incremental.is_incremental:
+                final_update_message = get_settings().pr_reviewer.final_update_message
+                self.git_provider.publish_persistent_comment(pr_review,
+                                                            initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
+                                                            update_header=True,
+                                                            final_update_message=final_update_message, )
+            else:
+                self.git_provider.publish_comment(pr_review)
+
+            self.git_provider.remove_initial_comment()
         except Exception as e:
             get_logger().error(f"Failed to review PR: {e}")
+
+    def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
+        return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
 
     async def _prepare_prediction(self, model: str) -> None:
         self.patches_diff = get_pr_diff(self.git_provider,
@@ -228,6 +238,10 @@ class PRReviewer:
                                         "relevant_file:", "relevant_line:", "suggestion:"],
                          first_key=first_key, last_key=last_key)
         github_action_output(data, 'review')
+
+        if 'review' not in data:
+            get_logger().exception("Failed to parse review data", artifact={"data": data})
+            return ""
 
         # move data['review'] 'key_issues_to_review' key to the end of the dictionary
         if 'key_issues_to_review' in data['review']:
@@ -312,7 +326,9 @@ class PRReviewer:
             get_logger().exception(f"Failed to remove previous review comment, error: {e}")
 
     def _can_run_incremental_review(self) -> bool:
-        """Checks if we can run incremental review according the various configurations and previous review"""
+        """
+        Checks if we can run incremental review according the various configurations and previous review.
+        """
         # checking if running is auto mode but there are no new commits
         if self.is_auto and not self.incremental.first_new_commit_sha:
             get_logger().info(f"Incremental review is enabled for {self.pr_url} but there are no new commits")

@@ -19,7 +19,7 @@ from pr_agent.algo.pr_processing import (add_ai_metadata_to_diff_files,
                                          retry_with_fallback_models)
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.utils import (ModelType, load_yaml, replace_code_tags,
-                                 show_relevant_configurations, get_max_tokens, clip_tokens)
+                                 show_relevant_configurations, get_max_tokens, clip_tokens, get_model)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers import (AzureDevopsProvider, GithubProvider,
                                     GitLabProvider, get_git_provider,
@@ -38,14 +38,6 @@ class PRCodeSuggestions:
         self.main_language = get_main_pr_language(
             self.git_provider.get_languages(), self.git_provider.get_files()
         )
-
-        # limit context specifically for the improve command, which has hard input to parse:
-        if get_settings().pr_code_suggestions.max_context_tokens:
-            MAX_CONTEXT_TOKENS_IMPROVE = get_settings().pr_code_suggestions.max_context_tokens
-            if get_settings().config.max_model_tokens > MAX_CONTEXT_TOKENS_IMPROVE:
-                get_logger().info(f"Setting max_model_tokens to {MAX_CONTEXT_TOKENS_IMPROVE} for PR improve")
-                get_settings().config.max_model_tokens_original = get_settings().config.max_model_tokens
-                get_settings().config.max_model_tokens = MAX_CONTEXT_TOKENS_IMPROVE
 
         num_code_suggestions = int(get_settings().pr_code_suggestions.num_code_suggestions_per_chunk)
 
@@ -121,7 +113,7 @@ class PRCodeSuggestions:
             # if not self.is_extended:
             #     data = await retry_with_fallback_models(self._prepare_prediction, model_type=ModelType.REGULAR)
             # else:
-            data = await retry_with_fallback_models(self._prepare_prediction_extended, model_type=ModelType.REGULAR)
+            data = await retry_with_fallback_models(self.prepare_prediction_main, model_type=ModelType.REGULAR)
             if not data:
                 data = {"code_suggestions": []}
             self.data = data
@@ -217,7 +209,8 @@ class PRCodeSuggestions:
 
     async def publish_no_suggestions(self):
         pr_body = "## PR Code Suggestions ✨\n\nNo code suggestions found for the PR."
-        if get_settings().config.publish_output and get_settings().config.publish_output_no_suggestions:
+        if (get_settings().config.publish_output and
+                get_settings().pr_code_suggestions.get('publish_output_no_suggestions', True)):
             get_logger().warning('No code suggestions found for the PR.')
             get_logger().debug(f"PR output", artifact=pr_body)
             if self.progress_response:
@@ -265,14 +258,6 @@ class PRCodeSuggestions:
             if match:
                 up_to_commit_txt = f" up to commit {match.group(0)[4:-3].strip()}"
             return up_to_commit_txt
-
-        if isinstance(git_provider, AzureDevopsProvider): # get_latest_commit_url is not supported yet
-            if progress_response:
-                git_provider.edit_comment(progress_response, pr_comment)
-                new_comment = progress_response
-            else:
-                new_comment = git_provider.publish_comment(pr_comment)
-            return new_comment
 
         history_header = f"#### Previous suggestions\n"
         last_commit_num = git_provider.get_latest_commit_url().split('/')[-1][:7]
@@ -415,9 +400,15 @@ class PRCodeSuggestions:
         data = self._prepare_pr_code_suggestions(response)
 
         # self-reflect on suggestions (mandatory, since line numbers are generated now here)
-        model_reflection = get_settings().config.model
+        model_reflect_with_reasoning = get_model('model_reasoning')
+        fallbacks = get_settings().config.fallback_models
+        if model_reflect_with_reasoning == get_settings().config.model and model != get_settings().config.model and fallbacks and model == \
+                fallbacks[0]:
+            # we are using a fallback model (should not happen on regular conditions)
+            get_logger().warning(f"Using the same model for self-reflection as the one used for suggestions")
+            model_reflect_with_reasoning = model
         response_reflect = await self.self_reflect_on_suggestions(data["code_suggestions"],
-                                                                  patches_diff, model=model_reflection)
+                                                                  patches_diff, model=model_reflect_with_reasoning)
         if response_reflect:
             await self.analyze_self_reflection_response(data, response_reflect)
         else:
@@ -615,11 +606,13 @@ class PRCodeSuggestions:
                     break
             if original_initial_line:
                 suggested_initial_line = new_code_snippet.splitlines()[0]
-                original_initial_spaces = len(original_initial_line) - len(original_initial_line.lstrip())
+                original_initial_spaces = len(original_initial_line) - len(original_initial_line.lstrip()) # lstrip works both for spaces and tabs
                 suggested_initial_spaces = len(suggested_initial_line) - len(suggested_initial_line.lstrip())
                 delta_spaces = original_initial_spaces - suggested_initial_spaces
                 if delta_spaces > 0:
-                    new_code_snippet = textwrap.indent(new_code_snippet, delta_spaces * " ").rstrip('\n')
+                    # Detect indentation character from original line
+                    indent_char = '\t' if original_initial_line.startswith('\t') else ' '
+                    new_code_snippet = textwrap.indent(new_code_snippet, delta_spaces * indent_char).rstrip('\n')
         except Exception as e:
             get_logger().error(f"Error when dedenting code snippet for file {relevant_file}, error: {e}")
 
@@ -674,7 +667,7 @@ class PRCodeSuggestions:
             get_logger().error(f"Error removing line numbers from patches_diff_list, error: {e}")
             return patches_diff_list
 
-    async def _prepare_prediction_extended(self, model: str) -> dict:
+    async def prepare_prediction_main(self, model: str) -> dict:
         # get PR diff
         if get_settings().pr_code_suggestions.decouple_hunks:
             self.patches_diff_list = get_pr_multi_diffs(self.git_provider,
@@ -784,7 +777,7 @@ class PRCodeSuggestions:
                 pr_body += "No suggestions found to improve this PR."
                 return pr_body
 
-            if get_settings().pr_code_suggestions.enable_intro_text and get_settings().config.is_auto_command:
+            if get_settings().config.is_auto_command:
                 pr_body += "Explore these optional code suggestions:\n\n"
 
             language_extension_map_org = get_settings().language_extension_map_org
@@ -943,6 +936,7 @@ class PRCodeSuggestions:
             with get_logger().contextualize(command="self_reflect_on_suggestions"):
                 response_reflect, finish_reason_reflect = await self.ai_handler.chat_completion(model=model,
                                                                                                 system=system_prompt_reflect,
+                                                                                                temperature=get_settings().config.temperature,
                                                                                                 user=user_prompt_reflect)
         except Exception as e:
             get_logger().info(f"Could not reflect on suggestions, error: {e}")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import copy
 import difflib
 import hashlib
@@ -14,7 +15,7 @@ import traceback
 from datetime import datetime
 from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, TypedDict
 
 import html2text
 import requests
@@ -30,9 +31,11 @@ from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.log import get_logger
 
 
-def get_weak_model() -> str:
-    if get_settings().get("config.model_weak"):
+def get_model(model_type: str = "model_weak") -> str:
+    if model_type == "model_weak" and get_settings().get("config.model_weak"):
         return get_settings().config.model_weak
+    elif model_type == "model_reasoning" and get_settings().get("config.model_reasoning"):
+        return get_settings().config.model_reasoning
     return get_settings().config.model
 
 
@@ -42,22 +45,36 @@ class Range(BaseModel):
     column_start: int = -1
     column_end: int = -1
 
+
 class ModelType(str, Enum):
     REGULAR = "regular"
     WEAK = "weak"
+    REASONING = "reasoning"
+
+
+class TodoItem(TypedDict):
+    relevant_file: str
+    line_range: Tuple[int, int]
+    content: str
+
 
 class PRReviewHeader(str, Enum):
     REGULAR = "## PR Reviewer Guide"
     INCREMENTAL = "## Incremental PR Reviewer Guide"
 
+
 class ReasoningEffort(str, Enum):
+    XHIGH = "xhigh"
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
+    MINIMAL = "minimal"
+    NONE = "none"
 
 
 class PRDescriptionHeader(str, Enum):
-    CHANGES_WALKTHROUGH = "### **Changes walkthrough** 📝"
+    DIAGRAM_WALKTHROUGH = "Diagram Walkthrough"
+    FILE_WALKTHROUGH = "File Walkthrough"
 
 
 def get_setting(key: str) -> Any:
@@ -107,6 +124,7 @@ def unique_strings(input_list: List[str]) -> List[str]:
             seen.add(item)
     return unique_list
 
+
 def convert_to_markdown_v2(output_data: dict,
                            gfm_supported: bool = True,
                            incremental_review=None,
@@ -129,9 +147,11 @@ def convert_to_markdown_v2(output_data: dict,
         "Focused PR": "✨",
         "Relevant ticket": "🎫",
         "Security concerns": "🔒",
+        "Todo sections": "📝",
         "Insights from user's answers": "📝",
         "Code feedback": "🤖",
         "Estimated effort to review [1-5]": "⏱️",
+        "Contribution time cost estimate": "⏳",
         "Ticket compliance check": "🎫",
     }
     markdown_text = ""
@@ -149,6 +169,7 @@ def convert_to_markdown_v2(output_data: dict,
     if gfm_supported:
         markdown_text += "<table>\n"
 
+    todo_summary = output_data['review'].pop('todo_summary', '')
     for key, value in output_data['review'].items():
         if value is None or value == '' or value == {} or value == []:
             if key.lower() not in ['can_be_split', 'key_issues_to_review']:
@@ -190,6 +211,14 @@ def convert_to_markdown_v2(output_data: dict,
                     markdown_text += f"### {emoji} PR contains tests\n\n"
         elif 'ticket compliance check' in key_nice.lower():
             markdown_text = ticket_markdown_logic(emoji, markdown_text, value, gfm_supported)
+        elif 'contribution time cost estimate' in key_nice.lower():
+            if gfm_supported:
+                markdown_text += f"<tr><td>{emoji}&nbsp;<strong>Contribution time estimate</strong> (best, average, worst case): "
+                markdown_text += f"{value['best_case'].replace('m', ' minutes')} | {value['average_case'].replace('m', ' minutes')} | {value['worst_case'].replace('m', ' minutes')}"
+                markdown_text += f"</td></tr>\n"
+            else:
+                markdown_text += f"### {emoji} Contribution time estimate (best, average, worst case): "
+                markdown_text += f"{value['best_case'].replace('m', ' minutes')} | {value['average_case'].replace('m', ' minutes')} | {value['worst_case'].replace('m', ' minutes')}\n\n"
         elif 'security concerns' in key_nice.lower():
             if gfm_supported:
                 markdown_text += f"<tr><td>"
@@ -207,6 +236,23 @@ def convert_to_markdown_v2(output_data: dict,
                     markdown_text += f"### {emoji} Security concerns\n\n"
                     value = emphasize_header(value.strip(), only_markdown=True)
                     markdown_text += f"{value}\n\n"
+        elif 'todo sections' in key_nice.lower():
+            if gfm_supported:
+                markdown_text += "<tr><td>"
+                if is_value_no(value):
+                    markdown_text += f"✅&nbsp;<strong>No TODO sections</strong>"
+                else:
+                    markdown_todo_items = format_todo_items(value, git_provider, gfm_supported)
+                    markdown_text += f"{emoji}&nbsp;<strong>TODO sections</strong>\n<br><br>\n"
+                    markdown_text += markdown_todo_items
+                markdown_text += "</td></tr>\n"
+            else:
+                if is_value_no(value):
+                    markdown_text += f"### ✅ No TODO sections\n\n"
+                else:
+                    markdown_todo_items = format_todo_items(value, git_provider, gfm_supported)
+                    markdown_text += f"### {emoji} TODO sections\n\n"
+                    markdown_text += markdown_todo_items
         elif 'can be split' in key_nice.lower():
             if gfm_supported:
                 markdown_text += f"<tr><td>"
@@ -705,7 +751,7 @@ def _fix_key_value(key: str, value: str):
 
 def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", last_key="") -> dict:
     response_text_original = copy.deepcopy(response_text)
-    response_text = response_text.strip('\n').removeprefix('```yaml').rstrip().removesuffix('```')
+    response_text = response_text.strip('\n').removeprefix('yaml').removeprefix('```yaml').rstrip().removesuffix('```')
     try:
         data = yaml.safe_load(response_text)
     except Exception as e:
@@ -729,8 +775,10 @@ def try_fix_yaml(response_text: str,
                  response_text_original="") -> dict:
     response_text_lines = response_text.split('\n')
 
-    keys_yaml = ['relevant line:', 'suggestion content:', 'relevant file:', 'existing code:', 'improved code:']
+    keys_yaml = ['relevant line:', 'suggestion content:', 'relevant file:', 'existing code:',
+                 'improved code:', 'label:', 'why:', 'suggestion_summary:']
     keys_yaml = keys_yaml + keys_fix_yaml
+
     # first fallback - try to convert 'relevant line: ...' to relevant line: |-\n        ...'
     response_text_lines_copy = response_text_lines.copy()
     for i in range(0, len(response_text_lines_copy)):
@@ -745,8 +793,29 @@ def try_fix_yaml(response_text: str,
     except:
         pass
 
-    # second fallback - try to extract only range from first ```yaml to ````
-    snippet_pattern = r'```(yaml)?[\s\S]*?```'
+    # 1.5 fallback - try to convert '|' to '|2'. Will solve cases of indent decreasing during the code
+    response_text_copy = copy.deepcopy(response_text)
+    response_text_copy = response_text_copy.replace('|\n', '|2\n')
+    try:
+        data = yaml.safe_load(response_text_copy)
+        get_logger().info(f"Successfully parsed AI prediction after replacing | with |2")
+        return data
+    except:
+        # if it fails, we can try to add spaces to the lines that are not indented properly, and contain '}'.
+        response_text_lines_copy = response_text_copy.split('\n')
+        for i in range(0, len(response_text_lines_copy)):
+            initial_space = len(response_text_lines_copy[i]) - len(response_text_lines_copy[i].lstrip())
+            if initial_space == 2 and '|2' not in response_text_lines_copy[i] and '}' in response_text_lines_copy[i]:
+                response_text_lines_copy[i] = '    ' + response_text_lines_copy[i].lstrip()
+        try:
+            data = yaml.safe_load('\n'.join(response_text_lines_copy))
+            get_logger().info(f"Successfully parsed AI prediction after replacing | with |2 and adding spaces")
+            return data
+        except:
+            pass
+
+    # second fallback - try to extract only range from first ```yaml to the last ```
+    snippet_pattern = r'```yaml([\s\S]*?)```(?=\s*$|")'
     snippet = re.search(snippet_pattern, '\n'.join(response_text_lines_copy))
     if not snippet:
         snippet = re.search(snippet_pattern, response_text_original) # before we removed the "```"
@@ -782,12 +851,13 @@ def try_fix_yaml(response_text: str,
         if index_end == -1:
             index_end = len(response_text)
         response_text_copy = response_text[index_start:index_end].strip().strip('```yaml').strip('`').strip()
-        try:
-            data = yaml.safe_load(response_text_copy)
-            get_logger().info(f"Successfully parsed AI prediction after extracting yaml snippet")
-            return data
-        except:
-            pass
+        if response_text_copy:
+            try:
+                data = yaml.safe_load(response_text_copy)
+                get_logger().info(f"Successfully parsed AI prediction after extracting yaml snippet")
+                return data
+            except:
+                pass
 
     # fifth fallback - try to remove leading '+' (sometimes added by AI for 'existing code' and 'improved code')
     response_text_lines_copy = response_text_lines.copy()
@@ -801,15 +871,71 @@ def try_fix_yaml(response_text: str,
     except:
         pass
 
-    # sixth fallback - try to remove last lines
-    for i in range(1, len(response_text_lines)):
-        response_text_lines_tmp = '\n'.join(response_text_lines[:-i])
+    # sixth fallback - replace tabs with spaces
+    if '\t' in response_text:
+        response_text_copy = copy.deepcopy(response_text)
+        response_text_copy = response_text_copy.replace('\t', '    ')
         try:
-            data = yaml.safe_load(response_text_lines_tmp)
-            get_logger().info(f"Successfully parsed AI prediction after removing {i} lines")
+            data = yaml.safe_load(response_text_copy)
+            get_logger().info(f"Successfully parsed AI prediction after replacing tabs with spaces")
             return data
         except:
             pass
+
+    # seventh fallback - add indent for sections of code blocks
+    response_text_copy = copy.deepcopy(response_text)
+    response_text_copy_lines = response_text_copy.split('\n')
+    start_line = -1
+    improve_sections = ['existing_code:', 'improved_code:', 'response:', 'why:']
+    describe_sections = ['description:', 'title:', 'changes_diagram:', 'pr_files:', 'pr_ticket:']
+    for i, line in enumerate(response_text_copy_lines):
+        line_stripped = line.rstrip()
+        if any(key in line_stripped for key in (improve_sections+describe_sections)):
+            start_line = i
+        elif line_stripped.endswith(': |') or line_stripped.endswith(': |-') or line_stripped.endswith(': |2') or any(line_stripped.endswith(key) for key in keys_yaml):
+            start_line = -1
+        elif start_line != -1:
+            response_text_copy_lines[i] = '    ' + line
+    response_text_copy = '\n'.join(response_text_copy_lines)
+    response_text_copy = response_text_copy.replace(' |\n', ' |2\n')
+    try:
+        data = yaml.safe_load(response_text_copy)
+        get_logger().info(f"Successfully parsed AI prediction after adding indent for sections of code blocks")
+        return data
+    except:
+        pass
+
+    # eighth fallback - try to remove pipe chars at the root-level dicts
+    response_text_copy = copy.deepcopy(response_text)
+    response_text_copy = response_text_copy.lstrip('|\n')
+    try:
+        data = yaml.safe_load(response_text_copy)
+        get_logger().info(f"Successfully parsed AI prediction after removing pipe chars")
+        return data
+    except:
+        pass
+
+    # ninth fallback - try to decode the response text with different encodings. GPT-5 can return text that is not utf-8 encoded.
+    encodings_to_try = ['latin-1', 'utf-16']
+    for encoding in encodings_to_try:
+        try:
+            data = yaml.safe_load(response_text.encode(encoding).decode("utf-8"))
+            if data:
+                get_logger().info(f"Successfully parsed AI prediction after decoding with {encoding} encoding")
+                return data
+        except:
+            pass
+
+    # # sixth fallback - try to remove last lines
+    # for i in range(1, len(response_text_lines)):
+    #     response_text_lines_tmp = '\n'.join(response_text_lines[:-i])
+    #     try:
+    #         data = yaml.safe_load(response_text_lines_tmp)
+    #         get_logger().info(f"Successfully parsed AI prediction after removing {i} lines")
+    #         return data
+    #     except:
+    #         pass
+
 
 
 def set_custom_labels(variables, git_provider=None):
@@ -878,6 +1004,7 @@ def get_max_tokens(model):
     elif settings.config.custom_model_max_tokens > 0:
         max_tokens_model = settings.config.custom_model_max_tokens
     else:
+        get_logger().error(f"Model {model} is not defined in MAX_TOKENS in ./pr_agent/algo/__init__.py and no custom_model_max_tokens is set")
         raise Exception(f"Ensure {model} is defined in MAX_TOKENS in ./pr_agent/algo/__init__.py or set a positive value for it in config.custom_model_max_tokens")
 
     if settings.config.max_model_tokens and settings.config.max_model_tokens > 0:
@@ -889,12 +1016,66 @@ def clip_tokens(text: str, max_tokens: int, add_three_dots=True, num_input_token
     """
     Clip the number of tokens in a string to a maximum number of tokens.
 
+    This function limits text to a specified token count by calculating the approximate
+    character-to-token ratio and truncating the text accordingly. A safety factor of 0.9
+    (10% reduction) is applied to ensure the result stays within the token limit.
+
     Args:
-        text (str): The string to clip.
+        text (str): The string to clip. If empty or None, returns the input unchanged.
         max_tokens (int): The maximum number of tokens allowed in the string.
-        add_three_dots (bool, optional): A boolean indicating whether to add three dots at the end of the clipped
+                         If negative, returns an empty string.
+        add_three_dots (bool, optional): Whether to add "\\n...(truncated)" at the end
+                                       of the clipped text to indicate truncation.
+                                       Defaults to True.
+        num_input_tokens (int, optional): Pre-computed number of tokens in the input text.
+                                        If provided, skips token encoding step for efficiency.
+                                        If None, tokens will be counted using TokenEncoder.
+                                        Defaults to None.
+        delete_last_line (bool, optional): Whether to remove the last line from the
+                                         clipped content before adding truncation indicator.
+                                         Useful for ensuring clean breaks at line boundaries.
+                                         Defaults to False.
+
     Returns:
-        str: The clipped string.
+        str: The clipped string. Returns original text if:
+             - Text is empty/None
+             - Token count is within limit
+             - An error occurs during processing
+
+             Returns empty string if max_tokens <= 0.
+
+    Examples:
+        Basic usage:
+        >>> text = "This is a sample text that might be too long"
+        >>> result = clip_tokens(text, max_tokens=10)
+        >>> print(result)
+        This is a sample...
+        (truncated)
+
+        Without truncation indicator:
+        >>> result = clip_tokens(text, max_tokens=10, add_three_dots=False)
+        >>> print(result)
+        This is a sample
+
+        With pre-computed token count:
+        >>> result = clip_tokens(text, max_tokens=5, num_input_tokens=15)
+        >>> print(result)
+        This...
+        (truncated)
+
+        With line deletion:
+        >>> multiline_text = "Line 1\\nLine 2\\nLine 3"
+        >>> result = clip_tokens(multiline_text, max_tokens=3, delete_last_line=True)
+        >>> print(result)
+        Line 1
+        Line 2
+        ...
+        (truncated)
+
+    Notes:
+        The function uses a safety factor of 0.9 (10% reduction) to ensure the
+        result stays within the token limit, as character-to-token ratios can vary.
+        If token encoding fails, the original text is returned with a warning logged.
     """
     if not text:
         return text
@@ -1143,14 +1324,35 @@ def process_description(description_full: str) -> Tuple[str, List]:
     if not description_full:
         return "", []
 
-    description_split = description_full.split(PRDescriptionHeader.CHANGES_WALKTHROUGH.value)
-    base_description_str = description_split[0]
-    changes_walkthrough_str = ""
-    files = []
-    if len(description_split) > 1:
-        changes_walkthrough_str = description_split[1]
+    # description_split = description_full.split(PRDescriptionHeader.FILE_WALKTHROUGH.value)
+    if PRDescriptionHeader.FILE_WALKTHROUGH.value in description_full:
+        try:
+            # FILE_WALKTHROUGH are presented in a collapsible section in the description
+            regex_pattern = r'<details.*?>\s*<summary>\s*<h3>\s*' + re.escape(PRDescriptionHeader.FILE_WALKTHROUGH.value) + r'\s*</h3>\s*</summary>'
+            description_split = re.split(regex_pattern, description_full, maxsplit=1, flags=re.DOTALL)
+
+            # If the regex pattern is not found, fallback to the previous method
+            if len(description_split) == 1:
+                get_logger().debug("Could not find regex pattern for file walkthrough, falling back to simple split")
+                description_split = description_full.split(PRDescriptionHeader.FILE_WALKTHROUGH.value, 1)
+        except Exception as e:
+            get_logger().warning(f"Failed to split description using regex, falling back to simple split: {e}")
+            description_split = description_full.split(PRDescriptionHeader.FILE_WALKTHROUGH.value, 1)
+
+        if len(description_split) < 2:
+            get_logger().error("Failed to split description into base and changes walkthrough", artifact={'description': description_full})
+            return description_full.strip(), []
+
+        base_description_str = description_split[0].strip()
+        changes_walkthrough_str = ""
+        files = []
+        if len(description_split) > 1:
+            changes_walkthrough_str = description_split[1]
+        else:
+            get_logger().debug("No changes walkthrough found")
     else:
-        get_logger().debug("No changes walkthrough found")
+        base_description_str = description_full.strip()
+        return base_description_str, []
 
     try:
         if changes_walkthrough_str:
@@ -1173,7 +1375,7 @@ def process_description(description_full: str) -> Tuple[str, List]:
                 try:
                     if isinstance(file_data, tuple):
                         file_data = file_data[0]
-                    pattern = r'<details>\s*<summary><strong>(.*?)</strong>\s*<dd><code>(.*?)</code>.*?</summary>\s*<hr>\s*(.*?)\s*<li>(.*?)</details>'
+                    pattern = r'<details>\s*<summary><strong>(.*?)</strong>\s*<dd><code>(.*?)</code>.*?</summary>\s*<hr>\s*(.*?)\s*(?:<li>|•)(.*?)</details>'
                     res = re.search(pattern, file_data, re.DOTALL)
                     if not res or res.lastindex != 4:
                         pattern_back = r'<details>\s*<summary><strong>(.*?)</strong><dd><code>(.*?)</code>.*?</summary>\s*<hr>\s*(.*?)\n\n\s*(.*?)</details>'
@@ -1185,6 +1387,8 @@ def process_description(description_full: str) -> Tuple[str, List]:
                         short_filename = res.group(1).strip()
                         short_summary = res.group(2).strip()
                         long_filename = res.group(3).strip()
+                        if long_filename.endswith('<ul>'):
+                            long_filename = long_filename[:-4].strip()
                         long_summary =  res.group(4).strip()
                         long_summary = long_summary.replace('<br> *', '\n*').replace('<br>','').replace('\n','<br>')
                         long_summary = h.handle(long_summary).strip()
@@ -1203,7 +1407,7 @@ def process_description(description_full: str) -> Tuple[str, List]:
                         if '<code>...</code>' in file_data:
                             pass # PR with many files. some did not get analyzed
                         else:
-                            get_logger().error(f"Failed to parse description", artifact={'description': file_data})
+                            get_logger().warning(f"Failed to parse description", artifact={'description': file_data})
                 except Exception as e:
                     get_logger().exception(f"Failed to process description: {e}", artifact={'description': file_data})
 
@@ -1257,3 +1461,47 @@ def set_file_languages(diff_files) -> List[FilePatchInfo]:
         get_logger().exception(f"Failed to set file languages: {e}")
 
     return diff_files
+
+def format_todo_item(todo_item: TodoItem, git_provider, gfm_supported) -> str:
+    relevant_file = todo_item.get('relevant_file', '').strip()
+    line_number = todo_item.get('line_number', '')
+    content = todo_item.get('content', '')
+    reference_link = git_provider.get_line_link(relevant_file, line_number, line_number)
+    file_ref = f"{relevant_file} [{line_number}]"
+    if reference_link:
+        if gfm_supported:
+            file_ref = f"<a href='{reference_link}'>{file_ref}</a>"
+        else:
+            file_ref = f"[{file_ref}]({reference_link})"
+
+    if content:
+        return f"{file_ref}: {content.strip()}"
+    else:
+        # if content is empty, return only the file reference
+        return file_ref
+
+
+def format_todo_items(value: list[TodoItem] | TodoItem, git_provider, gfm_supported) -> str:
+    markdown_text = ""
+    MAX_ITEMS = 5 # limit the number of items to display
+    if gfm_supported:
+        if isinstance(value, list):
+            markdown_text += "<ul>\n"
+            if len(value) > MAX_ITEMS:
+                get_logger().debug(f"Truncating todo items to {MAX_ITEMS} items")
+                value = value[:MAX_ITEMS]
+            for todo_item in value:
+                markdown_text += f"<li>{format_todo_item(todo_item, git_provider, gfm_supported)}</li>\n"
+            markdown_text += "</ul>\n"
+        else:
+            markdown_text += f"<p>{format_todo_item(value, git_provider, gfm_supported)}</p>\n"
+    else:
+        if isinstance(value, list):
+            if len(value) > MAX_ITEMS:
+                get_logger().debug(f"Truncating todo items to {MAX_ITEMS} items")
+                value = value[:MAX_ITEMS]
+            for todo_item in value:
+                markdown_text += f"- {format_todo_item(todo_item, git_provider, gfm_supported)}\n"
+        else:
+            markdown_text += f"- {format_todo_item(value, git_provider, gfm_supported)}\n"
+    return markdown_text

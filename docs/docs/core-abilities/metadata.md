@@ -1,4 +1,7 @@
-## Local and global metadata injection with multi-stage analysis
+# Local and global metadata injection with multi-stage analysis
+
+`Supported Git Platforms: GitHub, GitLab, Bitbucket`
+
 1\.
 Qodo Merge initially retrieves for each PR the following data:
 
@@ -23,7 +26,7 @@ This effectively enables multi-stage chain-of-thought analysis, without doing an
 
 For example, when generating code suggestions for different files, Qodo Merge can inject the AI-generated ["Changes walkthrough"](https://github.com/Codium-ai/pr-agent/pull/1202#issue-2511546839) file summary in the prompt:
 
-```
+```diff
 ## File: 'src/file1.py'
 ### AI-generated file summary:
 - edited function `func1` that does X
@@ -50,7 +53,6 @@ __old hunk__
 ```
 
 3\. The entire PR files that were retrieved are also used to expand and enhance the PR context (see [Dynamic Context](https://qodo-merge-docs.qodo.ai/core-abilities/dynamic_context/)).
-
 
 4\. All the metadata described above represents several level of cumulative analysis - ranging from hunk level, to file level, to PR level, to organization level.
 This comprehensive approach enables Qodo Merge AI models to generate more precise and contextually relevant suggestions and feedback.

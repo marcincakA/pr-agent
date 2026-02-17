@@ -12,6 +12,65 @@ from pr_agent.log import get_logger
 
 MAX_FILES_ALLOWED_FULL = 50
 
+def get_git_ssl_env() -> dict[str, str]:
+    """
+    Get git SSL configuration arguments for per-command use.
+    This fixes SSL certificate issues when cloning repos with self-signed certificates.
+    Returns the current environment with the addition of SSL config changes if any such SSL certificates exist.
+    """
+    ssl_cert_file = os.environ.get('SSL_CERT_FILE')
+    requests_ca_bundle = os.environ.get('REQUESTS_CA_BUNDLE')
+    git_ssl_ca_info = os.environ.get('GIT_SSL_CAINFO')
+
+    chosen_cert_file = ""
+
+    # Try SSL_CERT_FILE first
+    if ssl_cert_file:
+        if os.path.exists(ssl_cert_file):
+            if ((requests_ca_bundle and requests_ca_bundle != ssl_cert_file)
+                    or (git_ssl_ca_info and git_ssl_ca_info != ssl_cert_file)):
+                get_logger().warning(f"Found mismatch among: SSL_CERT_FILE, REQUESTS_CA_BUNDLE, GIT_SSL_CAINFO. "
+                                     f"Using the SSL_CERT_FILE to resolve ambiguity.",
+                                  artifact={"ssl_cert_file": ssl_cert_file, "requests_ca_bundle": requests_ca_bundle,
+                                            'git_ssl_ca_info': git_ssl_ca_info})
+            else:
+                get_logger().info(f"Using SSL certificate bundle for git operations", artifact={"ssl_cert_file": ssl_cert_file})
+            chosen_cert_file = ssl_cert_file
+        else:
+            get_logger().warning("SSL certificate bundle not found for git operations", artifact={"ssl_cert_file": ssl_cert_file})
+
+    # Fallback to REQUESTS_CA_BUNDLE
+    elif requests_ca_bundle:
+        if os.path.exists(requests_ca_bundle):
+            if (git_ssl_ca_info and git_ssl_ca_info != requests_ca_bundle):
+                get_logger().warning(f"Found mismatch between: REQUESTS_CA_BUNDLE, GIT_SSL_CAINFO. "
+                                     f"Using the REQUESTS_CA_BUNDLE to resolve ambiguity.",
+                artifact = {"requests_ca_bundle": requests_ca_bundle, 'git_ssl_ca_info': git_ssl_ca_info})
+            else:
+                get_logger().info("Using SSL certificate bundle from REQUESTS_CA_BUNDLE for git operations",
+                                  artifact={"requests_ca_bundle": requests_ca_bundle})
+            chosen_cert_file = requests_ca_bundle
+        else:
+            get_logger().warning("requests CA bundle not found for git operations", artifact={"requests_ca_bundle": requests_ca_bundle})
+
+    #Fallback to GIT CA:
+    elif git_ssl_ca_info:
+        if os.path.exists(git_ssl_ca_info):
+            get_logger().info("Using git SSL CA info from GIT_SSL_CAINFO for git operations",
+                              artifact={"git_ssl_ca_info": git_ssl_ca_info})
+            chosen_cert_file = git_ssl_ca_info
+        else:
+            get_logger().warning("git SSL CA info not found for git operations", artifact={"git_ssl_ca_info": git_ssl_ca_info})
+
+    else:
+        get_logger().warning("Neither SSL_CERT_FILE nor REQUESTS_CA_BUNDLE nor GIT_SSL_CAINFO are defined, or they are defined but not found. Returning environment without SSL configuration")
+
+    returned_env = os.environ.copy()
+    if chosen_cert_file:
+        returned_env.update({"GIT_SSL_CAINFO": chosen_cert_file, "REQUESTS_CA_BUNDLE": chosen_cert_file})
+    return returned_env
+
+
 class GitProvider(ABC):
     @abstractmethod
     def is_supported(self, capability: str) -> bool:
@@ -57,12 +116,21 @@ class GitProvider(ABC):
         # #Repo.clone_from(repo_url, dest_folder)
         # , but with throwing an exception upon timeout.
         # Note: This can only be used in context that supports using pipes.
+        try:
+            ssl_env = get_git_ssl_env()
+        except Exception as e:
+            get_logger().exception(
+                "Failed to prepare SSL environment for git operations, falling back to default env",
+                artifact={"error": e}
+            )
+            ssl_env = os.environ.copy()
+
         subprocess.run([
             "git", "clone",
             "--filter=blob:none",
             "--depth", "1",
             repo_url, dest_folder
-        ], check=True,  # check=True will raise an exception if the command fails
+        ], env=ssl_env, check=True,  # check=True will raise an exception if the command fails
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=operation_timeout_in_seconds)
 
     CLONE_TIMEOUT_SEC = 20
@@ -133,7 +201,7 @@ class GitProvider(ABC):
     def reply_to_comment_from_comment_id(self, comment_id: int, body: str):
         pass
 
-    def get_pr_description(self, full: bool = True, split_changes_walkthrough=False) -> str or tuple:
+    def get_pr_description(self, full: bool = True, split_changes_walkthrough=False) -> str | tuple:
         from pr_agent.algo.utils import clip_tokens
         from pr_agent.config_loader import get_settings
         max_tokens_description = get_settings().get("CONFIG.MAX_DESCRIPTION_TOKENS", None)
@@ -228,7 +296,7 @@ class GitProvider(ABC):
                                    update_header: bool = True,
                                    name='review',
                                    final_update_message=True):
-        self.publish_comment(pr_comment)
+        return self.publish_comment(pr_comment)
 
     def publish_persistent_comment_full(self, pr_comment: str,
                                    initial_header: str,
@@ -250,14 +318,13 @@ class GitProvider(ABC):
                     # response = self.mr.notes.update(comment.id, {'body': pr_comment_updated})
                     self.edit_comment(comment, pr_comment_updated)
                     if final_update_message:
-                        self.publish_comment(
+                        return self.publish_comment(
                             f"**[Persistent {name}]({comment_url})** updated to latest commit {latest_commit_url}")
-                    return
+                    return comment
         except Exception as e:
             get_logger().exception(f"Failed to update persistent review, error: {e}")
             pass
-        self.publish_comment(pr_comment)
-
+        return self.publish_comment(pr_comment)
 
     @abstractmethod
     def publish_inline_comment(self, body: str, relevant_file: str, relevant_line_in_file: str, original_suggestion=None):
@@ -285,6 +352,9 @@ class GitProvider(ABC):
 
     def get_comment_url(self, comment) -> str:
         return ""
+
+    def get_review_thread_comments(self, comment_id: int) -> list[dict]:
+        pass
 
     #### labels operations ####
     @abstractmethod
@@ -374,7 +444,6 @@ def get_main_pr_language(languages, files) -> str:
                         break
         except Exception as e:
             get_logger().exception(f"Failed to get main language: {e}")
-            pass
 
         ## old approach:
         # most_common_extension = max(set(extension_list), key=extension_list.count)
@@ -399,7 +468,6 @@ def get_main_pr_language(languages, files) -> str:
 
     except Exception as e:
         get_logger().exception(e)
-        pass
 
     return main_language_str
 

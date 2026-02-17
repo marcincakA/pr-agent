@@ -96,7 +96,7 @@ class GithubProvider(GitProvider):
                 parsed_url = urlparse(given_url)
                 repo_path = (parsed_url.path.split('.git')[0])[1:] # /<owner>/<repo>.git -> <owner>/<repo>
             if not repo_path:
-                get_logger().error(f"url is neither an issues url nor a pr url nor a valid git url: {given_url}. Returning empty result.")
+                get_logger().error(f"url is neither an issues url nor a PR url nor a valid git url: {given_url}. Returning empty result.")
                 return ""
             return repo_path
         except Exception as e:
@@ -133,7 +133,7 @@ class GithubProvider(GitProvider):
         if (not owner or not repo) and self.repo: #"else" - User did not provide an external git url, or not an issue, use self.repo object
             owner, repo = self.repo.split('/')
             scheme_and_netloc = self.base_url_html
-            desired_branch = self.get_pr_branch()
+            desired_branch = self.repo_obj.default_branch
         if not all([scheme_and_netloc, owner, repo]): #"else": Not invoked from a PR context,but no provided git url for context
             get_logger().error(f"Unable to get canonical url parts since missing context (PR or explicit git url)")
             return ("", "")
@@ -427,7 +427,41 @@ class GithubProvider(GitProvider):
                 self._publish_inline_comments_fallback_with_verification(comments)
             except Exception as e:
                 get_logger().error(f"Failed to publish inline code comments fallback, error: {e}")
-                raise e
+                raise e    
+    
+    def get_review_thread_comments(self, comment_id: int) -> list[dict]:
+        """
+        Retrieves all comments in the same thread as the given comment.
+        
+        Args:
+            comment_id: Review comment ID
+                
+        Returns:
+            List of comments in the same thread
+        """
+        try:
+            # Fetch all comments with a single API call
+            all_comments = list(self.pr.get_comments())
+            
+            # Find the target comment by ID
+            target_comment = next((c for c in all_comments if c.id == comment_id), None)
+            if not target_comment:
+                return []
+        
+            # Get root comment id
+            root_comment_id = target_comment.raw_data.get("in_reply_to_id", target_comment.id)
+            # Build the thread - include the root comment and all replies to it
+            thread_comments = [
+                c for c in all_comments if
+                c.id == root_comment_id or c.raw_data.get("in_reply_to_id") == root_comment_id
+            ]
+        
+        
+            return thread_comments
+                
+        except Exception as e:
+            get_logger().exception(f"Failed to get review comments for an inline ask command", artifact={"comment_id": comment_id, "error": e})
+            return []
 
     def _publish_inline_comments_fallback_with_verification(self, comments: list[dict]):
         """

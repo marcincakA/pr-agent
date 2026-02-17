@@ -1,19 +1,20 @@
 import os
-
 import litellm
 import openai
 import requests
 from litellm import acompletion
-from tenacity import retry, retry_if_exception_type, stop_after_attempt
+from tenacity import retry, retry_if_exception_type, retry_if_not_exception_type, stop_after_attempt
 
-from pr_agent.algo import CLAUDE_EXTENDED_THINKING_MODELS, NO_SUPPORT_TEMPERATURE_MODELS, SUPPORT_REASONING_EFFORT_MODELS, USER_MESSAGE_ONLY_MODELS
+from pr_agent.algo import CLAUDE_EXTENDED_THINKING_MODELS, NO_SUPPORT_TEMPERATURE_MODELS, SUPPORT_REASONING_EFFORT_MODELS, USER_MESSAGE_ONLY_MODELS, STREAMING_REQUIRED_MODELS
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
+from pr_agent.algo.ai_handlers.litellm_helpers import _handle_streaming_response, MockResponse, _get_azure_ad_token, \
+    _process_litellm_extra_body
 from pr_agent.algo.utils import ReasoningEffort, get_version
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 import json
 
-OPENAI_RETRIES = 5
+MODEL_RETRIES = 2
 
 
 class LiteLLMAIHandler(BaseAiHandler):
@@ -31,6 +32,9 @@ class LiteLLMAIHandler(BaseAiHandler):
         self.azure = False
         self.api_base = None
         self.repetition_penalty = None
+
+        if get_settings().get("LITELLM.DISABLE_AIOHTTP", False):
+            litellm.disable_aiohttp_transport = True
         if get_settings().get("OPENAI.KEY", None):
             openai.api_key = get_settings().openai.key
             litellm.openai_key = get_settings().openai.key
@@ -59,6 +63,7 @@ class LiteLLMAIHandler(BaseAiHandler):
             litellm.api_version = get_settings().openai.api_version
         if get_settings().get("OPENAI.API_BASE", None):
             litellm.api_base = get_settings().openai.api_base
+            self.api_base = get_settings().openai.api_base
         if get_settings().get("ANTHROPIC.KEY", None):
             litellm.anthropic_key = get_settings().anthropic.key
         if get_settings().get("COHERE.KEY", None):
@@ -67,6 +72,8 @@ class LiteLLMAIHandler(BaseAiHandler):
             litellm.api_key = get_settings().groq.key
         if get_settings().get("REPLICATE.KEY", None):
             litellm.replicate_key = get_settings().replicate.key
+        if get_settings().get("XAI.KEY", None):
+            litellm.api_key = get_settings().xai.key
         if get_settings().get("HUGGINGFACE.KEY", None):
             litellm.huggingface_key = get_settings().huggingface.key
         if get_settings().get("HUGGINGFACE.API_BASE", None) and 'huggingface' in get_settings().config.model:
@@ -95,7 +102,40 @@ class LiteLLMAIHandler(BaseAiHandler):
         if get_settings().get("DEEPINFRA.KEY", None):
             os.environ['DEEPINFRA_API_KEY'] = get_settings().get("DEEPINFRA.KEY")
 
-        # Models that only use user meessage
+        # Support mistral models
+        if get_settings().get("MISTRAL.KEY", None):
+            os.environ["MISTRAL_API_KEY"] = get_settings().get("MISTRAL.KEY")
+        
+        # Support codestral models
+        if get_settings().get("CODESTRAL.KEY", None):
+            os.environ["CODESTRAL_API_KEY"] = get_settings().get("CODESTRAL.KEY")
+
+        # Check for Azure AD configuration
+        if get_settings().get("AZURE_AD.CLIENT_ID", None):
+            self.azure = True
+            # Generate access token using Azure AD credentials from settings
+            access_token = _get_azure_ad_token()
+            litellm.api_key = access_token
+            openai.api_key = access_token
+            
+            # Set API base from settings
+            self.api_base = get_settings().azure_ad.api_base
+            litellm.api_base = self.api_base
+            openai.api_base = self.api_base
+
+        # Support for Openrouter models
+        if get_settings().get("OPENROUTER.KEY", None):
+            openrouter_api_key = get_settings().get("OPENROUTER.KEY", None)
+            os.environ["OPENROUTER_API_KEY"] = openrouter_api_key
+            litellm.api_key = openrouter_api_key
+            openai.api_key = openrouter_api_key
+
+            openrouter_api_base = get_settings().get("OPENROUTER.API_BASE", "https://openrouter.ai/api/v1")
+            os.environ["OPENROUTER_API_BASE"] = openrouter_api_base
+            self.api_base = openrouter_api_base
+            litellm.api_base = openrouter_api_base
+
+        # Models that only use user message
         self.user_message_only_models = USER_MESSAGE_ONLY_MODELS
 
         # Model that doesn't support temperature argument
@@ -106,6 +146,9 @@ class LiteLLMAIHandler(BaseAiHandler):
 
         # Models that support extended thinking
         self.claude_extended_thinking_models = CLAUDE_EXTENDED_THINKING_MODELS
+
+        # Models that require streaming
+        self.streaming_required_models = STREAMING_REQUIRED_MODELS
 
     def prepare_logs(self, response, system, user, resp, finish_reason):
         response_log = response.dict().copy()
@@ -156,7 +199,7 @@ class LiteLLMAIHandler(BaseAiHandler):
 
         return kwargs
 
-    def add_litellm_callbacks(selfs, kwargs) -> dict:
+    def add_litellm_callbacks(self, kwargs) -> dict:
         captured_extra = []
 
         def capture_logs(message):
@@ -218,8 +261,8 @@ class LiteLLMAIHandler(BaseAiHandler):
         return get_settings().get("OPENAI.DEPLOYMENT_ID", None)
 
     @retry(
-        retry=retry_if_exception_type((openai.APIError, openai.APIConnectionError, openai.APITimeoutError)), # No retry on RateLimitError
-        stop=stop_after_attempt(OPENAI_RETRIES)
+        retry=retry_if_exception_type(openai.APIError) & retry_if_not_exception_type(openai.RateLimitError),
+        stop=stop_after_attempt(MODEL_RETRIES),
     )
     async def chat_completion(self, model: str, system: str, user: str, temperature: float = 0.2, img_path: str = None):
         try:
@@ -246,6 +289,29 @@ class LiteLLMAIHandler(BaseAiHandler):
                     return f"Error fetching image: {img_path}", "error"
                 messages[1]["content"] = [{"type": "text", "text": messages[1]["content"]},
                                           {"type": "image_url", "image_url": {"url": img_path}}]
+
+            thinking_kwargs_gpt5 = None
+            if model.startswith('gpt-5'):
+                # Use configured reasoning_effort or default to MEDIUM
+                config_effort = get_settings().config.reasoning_effort
+                try:
+                    ReasoningEffort(config_effort)
+                    effort = config_effort
+                except (ValueError, TypeError):
+                    effort = ReasoningEffort.MEDIUM.value
+                    if config_effort is not None:
+                        get_logger().warning(
+                            f"Invalid reasoning_effort '{config_effort}' in config. "
+                            f"Using default '{effort}'. Valid values: {[e.value for e in ReasoningEffort]}"
+                        )
+
+                thinking_kwargs_gpt5 = {
+                    "reasoning_effort": effort,
+                    "allowed_openai_params": ["reasoning_effort"],
+                }
+                get_logger().info(f"Using reasoning_effort='{effort}' for GPT-5 model")
+                model = 'openai/'+model.replace('_thinking', '')  # remove _thinking suffix
+
 
             # Currently, some models do not support a separate system and user prompts
             if model in self.user_message_only_models or get_settings().config.custom_reasoning_model:
@@ -274,10 +340,25 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # get_logger().info(f"Adding temperature with value {temperature} to model {model}.")
                 kwargs["temperature"] = temperature
 
+            if thinking_kwargs_gpt5:
+                kwargs.update(thinking_kwargs_gpt5)
+                if 'temperature' in kwargs:
+                    del kwargs['temperature']
+
             # Add reasoning_effort if model supports it
-            if (model in self.support_reasoning_models):
-                supported_reasoning_efforts = [ReasoningEffort.HIGH.value, ReasoningEffort.MEDIUM.value, ReasoningEffort.LOW.value]
-                reasoning_effort = get_settings().config.reasoning_effort if (get_settings().config.reasoning_effort in supported_reasoning_efforts) else ReasoningEffort.MEDIUM.value
+            if model in self.support_reasoning_models:
+                config_effort = get_settings().config.reasoning_effort
+                try:
+                    ReasoningEffort(config_effort)
+                    reasoning_effort = config_effort
+                except (ValueError, TypeError):
+                    reasoning_effort = ReasoningEffort.MEDIUM.value
+                    if config_effort is not None:
+                        get_logger().warning(
+                            f"Invalid reasoning_effort '{config_effort}' in config. "
+                            f"Using default '{reasoning_effort}'. Valid values: {[e.value for e in ReasoningEffort]}"
+                        )
+
                 get_logger().info(f"Adding reasoning_effort with value {reasoning_effort} to model {model}.")
                 kwargs["reasoning_effort"] = reasoning_effort
 
@@ -308,35 +389,63 @@ class LiteLLMAIHandler(BaseAiHandler):
                     raise ValueError(f"LITELLM.EXTRA_HEADERS contains invalid JSON: {str(e)}")
                 kwargs["extra_headers"] = litellm_extra_headers
 
+            # Support for custom OpenAI body fields (e.g., Flex Processing)
+            kwargs = _process_litellm_extra_body(kwargs)
+
+            # Support for Bedrock custom inference profile via model_id
+            model_id = get_settings().get("litellm.model_id")
+            if model_id and 'bedrock/' in model:
+                kwargs["model_id"] = model_id
+                get_logger().info(f"Using Bedrock custom inference profile: {model_id}")
+
             get_logger().debug("Prompts", artifact={"system": system, "user": user})
 
             if get_settings().config.verbosity_level >= 2:
                 get_logger().info(f"\nSystem prompt:\n{system}")
                 get_logger().info(f"\nUser prompt:\n{user}")
 
-            response = await acompletion(**kwargs)
-        except (openai.APIError, openai.APITimeoutError) as e:
-            get_logger().warning(f"Error during LLM inference: {e}")
-            raise
-        except (openai.RateLimitError) as e:
+            # Get completion with automatic streaming detection
+            resp, finish_reason, response_obj = await self._get_completion(**kwargs)
+
+        except openai.RateLimitError as e:
             get_logger().error(f"Rate limit error during LLM inference: {e}")
             raise
-        except (Exception) as e:
+        except openai.APIError as e:
+            get_logger().warning(f"Error during LLM inference: {e}")
+            raise
+        except Exception as e:
             get_logger().warning(f"Unknown error during LLM inference: {e}")
             raise openai.APIError from e
-        if response is None or len(response["choices"]) == 0:
-            raise openai.APIError
-        else:
-            resp = response["choices"][0]['message']['content']
-            finish_reason = response["choices"][0]["finish_reason"]
-            get_logger().debug(f"\nAI response:\n{resp}")
 
-            # log the full response for debugging
-            response_log = self.prepare_logs(response, system, user, resp, finish_reason)
-            get_logger().debug("Full_response", artifact=response_log)
+        get_logger().debug(f"\nAI response:\n{resp}")
 
-            # for CLI debugging
-            if get_settings().config.verbosity_level >= 2:
-                get_logger().info(f"\nAI response:\n{resp}")
+        # log the full response for debugging
+        response_log = self.prepare_logs(response_obj, system, user, resp, finish_reason)
+        get_logger().debug("Full_response", artifact=response_log)
+
+        # for CLI debugging
+        if get_settings().config.verbosity_level >= 2:
+            get_logger().info(f"\nAI response:\n{resp}")
 
         return resp, finish_reason
+
+    async def _get_completion(self, **kwargs):
+        """
+        Wrapper that automatically handles streaming for required models.
+        """
+        model = kwargs["model"]
+        if model in self.streaming_required_models:
+            kwargs["stream"] = True
+            get_logger().info(f"Using streaming mode for model {model}")
+            response = await acompletion(**kwargs)
+            resp, finish_reason = await _handle_streaming_response(response)
+            # Create MockResponse for streaming since we don't have the full response object
+            mock_response = MockResponse(resp, finish_reason)
+            return resp, finish_reason, mock_response
+        else:
+            response = await acompletion(**kwargs)
+            if response is None or len(response["choices"]) == 0:
+                raise openai.APIError
+            return (response["choices"][0]['message']['content'],
+                    response["choices"][0]["finish_reason"],
+                    response)

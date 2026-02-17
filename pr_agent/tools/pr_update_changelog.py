@@ -58,7 +58,7 @@ class PRUpdateChangelog:
                             'config': dict(get_settings().config)}
         get_logger().debug("Relevant configs", artifacts=relevant_configs)
 
-        # currently only GitHub is supported for pushing changelog changes
+        # check if the git provider supports pushing changelog changes
         if get_settings().pr_update_changelog.push_changelog_changes and not hasattr(
             self.git_provider, "create_or_update_pr_file"
         ):
@@ -128,6 +128,7 @@ class PRUpdateChangelog:
             existing_content = self.changelog_file
         else:
             existing_content = ""
+        
         if existing_content:
             new_file_content = answer + "\n\n" + self.changelog_file
         else:
@@ -140,11 +141,15 @@ class PRUpdateChangelog:
         return new_file_content, answer
 
     def _push_changelog_update(self, new_file_content, answer):
+        if get_settings().pr_update_changelog.get("skip_ci_on_push", True):
+            commit_message = "[skip ci] Update CHANGELOG.md"
+        else:
+            commit_message = "Update CHANGELOG.md"
         self.git_provider.create_or_update_pr_file(
             file_path="CHANGELOG.md",
             branch=self.git_provider.get_pr_branch(),
             contents=new_file_content,
-            message="[skip ci] Update CHANGELOG.md",
+            message=commit_message,
         )
 
         sleep(5)  # wait for the file to be updated
@@ -182,12 +187,18 @@ Example:
             self.changelog_file = self.git_provider.get_pr_file_content(
                 "CHANGELOG.md", self.git_provider.get_pr_branch()
             )
+            
+            if isinstance(self.changelog_file, bytes):
+                self.changelog_file = self.changelog_file.decode('utf-8')
+            
             changelog_file_lines = self.changelog_file.splitlines()
             changelog_file_lines = changelog_file_lines[:CHANGELOG_LINES]
             self.changelog_file_str = "\n".join(changelog_file_lines)
-        except Exception:
+        except Exception as e:
+            get_logger().warning(f"Error getting changelog file: {e}")
             self.changelog_file_str = ""
             self.changelog_file = ""
+            return
 
         if not self.changelog_file_str:
             self.changelog_file_str = self._get_default_changelog()

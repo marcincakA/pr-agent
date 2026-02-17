@@ -24,7 +24,7 @@ from pr_agent.identity_providers.identity_provider import Eligibility
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
 from pr_agent.servers.utils import DefaultDictWithTimeout, verify_signature
 
-setup_logger(fmt=LoggingFormat.JSON, level="DEBUG")
+setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
 base_path = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 build_number_path = os.path.join(base_path, "build_number.txt")
 if os.path.exists(build_number_path):
@@ -258,11 +258,19 @@ def should_process_pr_logic(body) -> bool:
         source_branch = pull_request.get("head", {}).get("ref", "")
         target_branch = pull_request.get("base", {}).get("ref", "")
         sender = body.get("sender", {}).get("login")
+        repo_full_name = body.get("repository", {}).get("full_name", "")
+
+        # logic to ignore PRs from specific repositories
+        ignore_repos = get_settings().get("CONFIG.IGNORE_REPOSITORIES", [])
+        if ignore_repos and repo_full_name:
+            if any(re.search(regex, repo_full_name) for regex in ignore_repos):
+                get_logger().info(f"Ignoring PR from repository '{repo_full_name}' due to 'config.ignore_repositories' setting")
+                return False
 
         # logic to ignore PRs from specific users
         ignore_pr_users = get_settings().get("CONFIG.IGNORE_PR_AUTHORS", [])
         if ignore_pr_users and sender:
-            if sender in ignore_pr_users:
+            if any(re.search(regex, sender) for regex in ignore_pr_users):
                 get_logger().info(f"Ignoring PR from user '{sender}' due to 'config.ignore_pr_authors' setting")
                 return False
 

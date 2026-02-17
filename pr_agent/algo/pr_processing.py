@@ -12,7 +12,7 @@ from pr_agent.algo.git_patch_processing import (
 from pr_agent.algo.language_handler import sort_files_by_main_languages
 from pr_agent.algo.token_handler import TokenHandler
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
-from pr_agent.algo.utils import ModelType, clip_tokens, get_max_tokens, get_weak_model
+from pr_agent.algo.utils import ModelType, clip_tokens, get_max_tokens, get_model
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.log import get_logger
@@ -329,17 +329,22 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
             )
             get_settings().set("openai.deployment_id", deployment_id)
             return await f(model)
-        except:
+        except Exception as e:
             get_logger().warning(
-                f"Failed to generate prediction with {model}"
+                f"Failed to generate prediction with {model}",
+                artifact={"error": e},
             )
             if i == len(all_models) - 1:  # If it's the last iteration
-                raise Exception(f"Failed to generate prediction with any model of {all_models}")
+                raise Exception(f"Failed to generate prediction with any model of {all_models}") from e
 
 
 def _get_all_models(model_type: ModelType = ModelType.REGULAR) -> List[str]:
     if model_type == ModelType.WEAK:
-        model = get_weak_model()
+        model = get_model('model_weak')
+    elif model_type == ModelType.REASONING:
+        model = get_model('model_reasoning')
+    elif model_type == ModelType.REGULAR:
+        model = get_settings().config.model
     else:
         model = get_settings().config.model
     fallback_models = get_settings().config.fallback_models
@@ -394,11 +399,6 @@ def get_pr_multi_diffs(git_provider: GitProvider,
     # Sort files by main language
     pr_languages = sort_files_by_main_languages(git_provider.get_languages(), diff_files)
 
-    # Sort files within each language group by tokens in descending order
-    sorted_files = []
-    for lang in pr_languages:
-        sorted_files.extend(sorted(lang['files'], key=lambda x: x.tokens, reverse=True))
-
     # Get the maximum number of extra lines before and after the patch
     PATCH_EXTRA_LINES_BEFORE = get_settings().config.patch_extra_lines_before
     PATCH_EXTRA_LINES_AFTER = get_settings().config.patch_extra_lines_after
@@ -415,6 +415,11 @@ def get_pr_multi_diffs(git_provider: GitProvider,
     # if we are under the limit, return the full diff
     if total_tokens + OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD < get_max_tokens(model):
         return ["\n".join(patches_extended)] if patches_extended else []
+
+    # Sort files within each language group by tokens in descending order
+    sorted_files = []
+    for lang in pr_languages:
+        sorted_files.extend(sorted(lang['files'], key=lambda x: x.tokens, reverse=True))
 
     patches = []
     final_diff_list = []

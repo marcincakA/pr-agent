@@ -4,10 +4,10 @@
         Search through our documentation using AI-powered natural language queries.
     </p>
     <div class="search-container">
-        <input 
-            type="text" 
-            id="searchInput" 
-            class="search-input" 
+        <input
+            type="text"
+            id="searchInput"
+            class="search-input"
             placeholder="Enter your search term..."
         >
         <button id="searchButton" class="search-button">Search</button>
@@ -19,7 +19,6 @@
 </div>
 
 <style>
-Untitled
 .search-section {
     max-width: 800px;
     margin: 0 auto;
@@ -202,20 +201,34 @@ h1 {
 
 <script>
 window.addEventListener('load', function() {
-    function displayResults(responseText) {
+    function extractText(responseText) {
+        try {
+            console.log('responseText: ', responseText);
+            const results = JSON.parse(responseText);
+            const msg = results.message;
+
+            if (!msg || msg.trim() === '') {
+                return "No results found";
+            }
+            return msg;
+        } catch (error) {
+            console.error('Error parsing results:', error);
+            throw new Error("Failed parsing response message");
+        }
+    }
+
+    function displayResults(msg) {
         const resultsContainer = document.getElementById('results');
         const spinner = document.getElementById('spinner');
         const searchContainer = document.querySelector('.search-container');
-        
+
         // Hide spinner
         spinner.style.display = 'none';
-        
+
         // Scroll to search bar
         searchContainer.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        
-        try {
-            const results = JSON.parse(responseText);
 
+        try {
             marked.setOptions({
                 breaks: true,
                 gfm: true,
@@ -223,8 +236,8 @@ window.addEventListener('load', function() {
                 sanitize: false
             });
 
-            const htmlContent = marked.parse(results.message);
-            
+            const htmlContent = marked.parse(msg);
+
             resultsContainer.className = 'markdown-content';
             resultsContainer.innerHTML = htmlContent;
 
@@ -234,7 +247,7 @@ window.addEventListener('load', function() {
                 const offset = 55; // Offset from top in pixels
                 const elementPosition = searchContainer.getBoundingClientRect().top;
                 const offsetPosition = elementPosition + window.pageYOffset - offset;
-                
+
                 window.scrollTo({
                     top: offsetPosition,
                     behavior: 'smooth'
@@ -242,7 +255,7 @@ window.addEventListener('load', function() {
             }, 100);
         } catch (error) {
             console.error('Error parsing results:', error);
-            resultsContainer.innerHTML = '<div class="error-message">Error processing results</div>';
+            resultsContainer.innerHTML = '<div class="error-message">Cannot process results</div>';
         }
     }
 
@@ -261,7 +274,7 @@ window.addEventListener('load', function() {
         spinner.style.display = 'flex';
         resultsContainer.innerHTML = '';
 
-        try { 
+        try {
             const data = {
                 "query": searchTerm
             };
@@ -275,35 +288,35 @@ window.addEventListener('load', function() {
                 body: JSON.stringify(data)
             };
 
-            // const API_ENDPOINT = 'http://0.0.0.0:3000/api/v1/docs_help';
+            //const API_ENDPOINT = 'http://0.0.0.0:3000/api/v1/docs_help';
             const API_ENDPOINT = 'https://help.merge.qodo.ai/api/v1/docs_help';
 
             const response = await fetch(API_ENDPOINT, options);
+            const responseText = await response.text();
+            const msg = extractText(responseText);
 
             if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
+                throw new Error(`An error (${response.status}) occurred during search: "${msg}"`);
             }
-
-            const responseText = await response.text();
-            displayResults(responseText);
+ 
+            displayResults(msg);
         } catch (error) {
             spinner.style.display = 'none';
-            resultsContainer.innerHTML = `
-                <div class="error-message">
-                    An error occurred while searching. Please try again later.
-                </div>
-            `;
+            const errorDiv = document.createElement('div');
+            errorDiv.className = 'error-message';
+            errorDiv.textContent = error instanceof Error ? error.message : String(error);
+            resultsContainer.replaceChildren(errorDiv);
         }
     }
 
     // Add event listeners
     const searchButton = document.getElementById('searchButton');
     const searchInput = document.getElementById('searchInput');
-    
+
     if (searchButton) {
         searchButton.addEventListener('click', performSearch);
     }
-    
+
     if (searchInput) {
         searchInput.addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {

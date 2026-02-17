@@ -51,7 +51,7 @@ class PRAgent:
     def __init__(self, ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
         self.ai_handler = ai_handler  # will be initialized in run_action
 
-    async def handle_request(self, pr_url, request, notify=None) -> bool:
+    async def _handle_request(self, pr_url, request, notify=None) -> bool:
         # First, apply repo specific settings if exists
         apply_repo_settings(pr_url)
 
@@ -84,10 +84,18 @@ class PRAgent:
                 if str(type(setting)) == "<class 'dynaconf.utils.boxing.DynaBox'>":
                     if hasattr(setting, 'extra_instructions'):
                         current_extra_instructions = setting.extra_instructions
-                        if current_extra_instructions:
-                            setting.extra_instructions = current_extra_instructions+ f"\n======\n\nIn addition, Your response MUST be written in the language corresponding to local code: {response_language}. This is crucial."
-                        else:
-                            setting.extra_instructions = f"Your response MUST be written in the language corresponding to locale code: '{response_language}'. This is crucial."
+                        
+                        # Define the language-specific instruction and the separator
+                        lang_instruction_text = f"Your response MUST be written in the language corresponding to locale code: '{response_language}'. This is crucial."
+                        separator_text = "\n======\n\nIn addition, "
+
+                        # Check if the specific language instruction is already present to avoid duplication
+                        if lang_instruction_text not in str(current_extra_instructions):
+                            if current_extra_instructions: # If there's existing text
+                                setting.extra_instructions = str(current_extra_instructions) + separator_text + lang_instruction_text
+                            else: # If extra_instructions was None or empty
+                                setting.extra_instructions = lang_instruction_text
+                        # If lang_instruction_text is already present, do nothing.
 
         action = action.lstrip("/").lower()
         if action not in command2class:
@@ -109,3 +117,10 @@ class PRAgent:
             else:
                 return False
             return True
+
+    async def handle_request(self, pr_url, request, notify=None) -> bool:
+        try:
+            return await self._handle_request(pr_url, request, notify)
+        except:
+            get_logger().exception("Failed to process the command.")
+            return False
